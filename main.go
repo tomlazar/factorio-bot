@@ -2,30 +2,49 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	rcon "github.com/gtaylor/factorio-rcon"
 	"github.com/pkg/errors"
+	"github.com/tomlazar/factorio-bot/logger"
+	"go.uber.org/zap"
 )
 
-type Users map[string]bool
+// Ctx is the current internals of the tcp and the rcon server
+type Ctx struct {
+	hook string
+	rcon *rcon.RCON
+}
 
-func GetUsers(addr, pass string) (Users, error) {
+// NewCtx sets up the server connetion and the logger
+func NewCtx(addr, pass, hook string) (*Ctx, error) {
 	r, err := rcon.Dial(addr)
 	if err != nil {
 		return nil, errors.Wrapf(err, "NewConnection %v", addr)
 	}
+
 	err = r.Authenticate(pass)
 	if err != nil {
 		return nil, errors.Wrapf(err, "new connection %v", addr)
 	}
 
-	players, err := r.CmdPlayers()
+	return &Ctx{hook, r}, nil
+}
+
+// Users is a map of users to their current status
+type Users map[string]bool
+
+// GetUsers get the current list of users from the server
+func (c *Ctx) GetUsers() (Users, error) {
+	players, err := c.rcon.CmdPlayers()
 	if err != nil {
 		return nil, err
 	}
@@ -38,6 +57,12 @@ func GetUsers(addr, pass string) (Users, error) {
 	return users, nil
 }
 
+// Close cleanly shuts down the tcp connection
+func (c *Ctx) Close() error {
+	return c.rcon.Close()
+}
+
+// Cmp compares the old state to the new one
 func (old Users) Cmp(new Users) []string {
 	type change struct{ was, is bool }
 
@@ -74,11 +99,9 @@ func (old Users) Cmp(new Users) []string {
 	return messages
 }
 
-func Post(endpoint, message string) error {
-	body := struct {
-		Content string `json:"content"`
-	}{
-		Content: message,
+func (c *Ctx) post(message string) error {
+	body := map[string]string{
+		"content": message,
 	}
 
 	text, err := json.Marshal(body)
@@ -86,42 +109,92 @@ func Post(endpoint, message string) error {
 		return err
 	}
 
-	log.Printf("change msg sent %v", message)
-	_, err = http.Post(endpoint, "application/json", bytes.NewBuffer(text))
+	_, err = http.Post(c.hook, "application/json", bytes.NewBuffer(text))
 	return err
+}
+
+// Post tries to sent the message to discord 3 times
+func (c *Ctx) Post(message string) error {
+	var err error
+	for i := 0; i < 3; i++ {
+		err = c.post(message)
+		if err == nil {
+			return err
+		}
+	}
+
+	return err
+}
+
+func (c *Ctx) Scan(ctx context.Context, log *zap.Logger, done chan bool) {
+	state, err := c.GetUsers()
+	if err != nil {
+		log.Error("could not load initial state", zap.Error(err))
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("main loop canceled through context")
+			done <- true
+			return
+		default:
+			log.Debug("scan loop execution")
+
+			// wait for five seconds
+			time.Sleep(5 * time.Second)
+
+			// get the state
+			new, err := c.GetUsers()
+			if err != nil {
+				panic(err)
+			}
+
+			for _, change := range state.Cmp(new) {
+				err = c.Post(change)
+				if err != nil {
+					panic(err)
+				}
+			}
+
+			// set state to new
+			state = new
+		}
+	}
 }
 
 func main() {
 	var (
-		addr = flag.String("addr", "", "the rcon address")
-		pass = flag.String("pass", "", "the rcon password")
-		hook = flag.String("hook", "", "the hook url")
+		addr  = flag.String("addr", "", "the rcon address")
+		pass  = flag.String("pass", "", "the rcon password")
+		hook  = flag.String("hook", "", "the hook url")
+		debug = flag.Bool("debug", false, "add debug info")
 	)
 	flag.Parse()
 
-	state, err := GetUsers(*addr, *pass)
+	log, err := logger.New(*debug)
 	if err != nil {
-		panic(err) //todo anything but this
+		panic(err)
 	}
 
-	for {
-		// wait
-		time.Sleep(5 * time.Second)
-
-		// get the state
-		new, err := GetUsers(*addr, *pass)
-		if err != nil {
-			panic(err)
-		}
-
-		for _, change := range state.Cmp(new) {
-			err = Post(*hook, change)
-			if err != nil {
-				panic(err)
-			}
-		}
-
-		// set state to new
-		state = new
+	ctx, err := NewCtx(*addr, *pass, *hook)
+	if err != nil {
+		panic(err)
 	}
+	defer ctx.Close()
+
+	// create a cancel context
+	context, cancel := context.WithCancel(context.Background())
+
+	sigs := make(chan os.Signal, 1)
+	done := make(chan bool)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	// start the scan loop
+	go ctx.Scan(context, log, done)
+
+	// monitor for sigclose
+	<-sigs
+	cancel()
+	<-done
 }
