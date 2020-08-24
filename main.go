@@ -12,9 +12,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tomlazar/factorio-bot/logger"
+
 	rcon "github.com/gtaylor/factorio-rcon"
 	"github.com/pkg/errors"
-	"github.com/tomlazar/factorio-bot/logger"
 	"go.uber.org/zap"
 )
 
@@ -147,13 +148,18 @@ func (c *Ctx) Scan(ctx context.Context, log *zap.Logger, done chan bool) {
 			// get the state
 			new, err := c.GetUsers()
 			if err != nil {
-				panic(err)
+				log.Error("could not get users from the rcon server", zap.Error(err))
+				continue
 			}
 
 			for _, change := range state.Cmp(new) {
 				err = c.Post(change)
 				if err != nil {
-					panic(err)
+					log.Error("could not post changes to discord",
+						zap.String("msg", change),
+						zap.Error(err),
+					)
+					continue
 				}
 			}
 
