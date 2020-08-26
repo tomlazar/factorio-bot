@@ -22,29 +22,104 @@ import (
 // Ctx is the current internals of the tcp and the rcon server
 type Ctx struct {
 	hook string
-	rcon *rcon.RCON
+
+	addr        string
+	pass        string
+	rcon        *rcon.RCON
+	isConnected bool
 }
 
 // NewCtx sets up the server connetion and the logger
 func NewCtx(addr, pass, hook string) (*Ctx, error) {
-	r, err := rcon.Dial(addr)
+	return &Ctx{
+		hook: hook,
+		addr: addr,
+		pass: pass,
+
+		rcon: nil,
+	}, nil
+}
+
+func (c *Ctx) Connect() error {
+	r, err := rcon.Dial(c.addr)
 	if err != nil {
-		return nil, errors.Wrapf(err, "NewConnection %v", addr)
+		return errors.Wrapf(err, "NewConnection %v", c.addr)
 	}
 
-	err = r.Authenticate(pass)
+	err = r.Authenticate(c.pass)
 	if err != nil {
-		return nil, errors.Wrapf(err, "new connection %v", addr)
+		return errors.Wrapf(err, "new connection %v", c.pass)
 	}
 
-	return &Ctx{hook, r}, nil
+	// save states
+	c.rcon = r
+	c.isConnected = true
+
+	return nil
+}
+
+func (c *Ctx) Disconect() error {
+	if c.isConnected {
+		err := c.rcon.Close()
+		if err != nil {
+			return err
+		}
+
+		c.isConnected = false
+		c.rcon = nil
+	}
+
+	return nil
 }
 
 // Users is a map of users to their current status
 type Users map[string]bool
 
 // GetUsers get the current list of users from the server
-func (c *Ctx) GetUsers() (Users, error) {
+func (c *Ctx) GetUsers(log *zap.Logger) (Users, error) {
+	if c.isConnected == false {
+		err := c.Connect()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var (
+		u   Users
+		err error
+		i   int
+	)
+	for i = 0; i < 3; i++ {
+		u, err = c.getUsers()
+		if err == nil {
+			return u, err
+		}
+
+		log.Error("could not get users from rcon, reconnecting",
+			zap.Error(err),
+		)
+
+		err = c.Disconect()
+		if err != nil {
+			return nil, err
+		}
+
+		err = c.Connect()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if i != 0 {
+		log.Warn("get users succeeded after retries",
+			zap.Int("retries", i),
+		)
+	}
+
+	return u, err
+}
+
+func (c *Ctx) getUsers() (Users, error) {
 	players, err := c.rcon.CmdPlayers()
 	if err != nil {
 		return nil, err
@@ -128,7 +203,7 @@ func (c *Ctx) Post(message string) error {
 }
 
 func (c *Ctx) Scan(ctx context.Context, log *zap.Logger, done chan bool) {
-	state, err := c.GetUsers()
+	state, err := c.GetUsers(log)
 	if err != nil {
 		log.Error("could not load initial state", zap.Error(err))
 	}
@@ -146,13 +221,17 @@ func (c *Ctx) Scan(ctx context.Context, log *zap.Logger, done chan bool) {
 			time.Sleep(5 * time.Second)
 
 			// get the state
-			new, err := c.GetUsers()
+			new, err := c.GetUsers(log)
 			if err != nil {
 				log.Error("could not get users from the rcon server", zap.Error(err))
 				continue
 			}
 
 			for _, change := range state.Cmp(new) {
+				log.Info("posting change",
+					zap.String("message", change),
+				)
+
 				err = c.Post(change)
 				if err != nil {
 					log.Error("could not post changes to discord",
